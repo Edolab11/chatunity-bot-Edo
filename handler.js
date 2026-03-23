@@ -7,7 +7,7 @@ import fs from 'fs'
 import chalk from 'chalk'
 import { messageQueue, commandQueue, mediaQueue } from './lib/queue.js'
 
-const { proto } = (await import('@whiskeysockets/baileys')).default
+const { proto } = await import('@whiskeysocket/baileys')
 
 const isNumber = x => typeof x === 'number' && !isNaN(x)
 const delay = ms => isNumber(ms) && new Promise(resolve => setTimeout(function () {
@@ -23,284 +23,263 @@ global.groupMetaCache = global.groupMetaCache || new Map()
 
 const DUPLICATE_WINDOW = 3000
 const GROUP_META_CACHE_TTL = 300000
+const MEDIA_GIF_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'media', 'gif')
+const ___dirname = path.join(path.dirname(fileURLToPath(import.meta.url)), './plugins')
 
 function selectQueue(m) {
-  if (m.isCommand || (typeof m.text === 'string' && (m.text.startsWith('.') || m.text.startsWith('/')))) {
-    return commandQueue
-  }
-
-  if (m.mtype?.includes('image') || m.mtype?.includes('video')) {
-    return messageQueue  
-  }
-
-  if (m.mtype?.includes('audio') || m.mtype?.includes('document') || m.mtype?.includes('sticker')) {
-    return mediaQueue
-  }
-
+  if (m.isCommand || (typeof m.text === 'string' && (m.text.startsWith('.') || m.text.startsWith('/')))) return commandQueue
+  if (m.mtype?.includes('image') || m.mtype?.includes('video')) return messageQueue
+  if (m.mtype?.includes('audio') || m.mtype?.includes('document') || m.mtype?.includes('sticker')) return mediaQueue
   return messageQueue
+}
+
+function getJidUser(jid) {
+  return typeof jid === 'string' ? jid.split('@')[0].split(':')[0] : ''
+}
+
+function invalidateGroupMetaCache(chatId) {
+  if (!chatId) return
+  global.groupMetaCache.delete(chatId)
+}
+
+async function getGroupMetadataCached(conn, chatId, { force = false } = {}) {
+  const cached = global.groupMetaCache.get(chatId)
+  if (!force && cached && Date.now() - cached.timestamp < GROUP_META_CACHE_TTL) {
+    return cached.data
+  }
+
+  const metadata = await conn.groupMetadata(chatId).catch(() => null)
+  if (metadata) {
+    global.groupMetaCache.set(chatId, { data: metadata, timestamp: Date.now() })
+    return metadata
+  }
+
+  return cached?.data || null
+}
+
+function normalizePhoneJid(value) {
+  if (typeof value !== 'string') return null
+  if (value.includes('@')) return value
+  const digits = value.replace(/\D/g, '')
+  return digits ? `${digits}@s.whatsapp.net` : null
+}
+
+function hasAdminRole(participant) {
+  return participant?.admin === 'admin' || participant?.admin === 'superadmin'
+}
+
+async function getComparableJids(conn, jid, participants = []) {
+  const variants = new Set()
+  const addCandidate = (value) => {
+    if (typeof value !== 'string' || !value) return
+    variants.add(value)
+    const decoded = conn.decodeJid ? conn.decodeJid(value) : value
+    if (typeof decoded === 'string' && decoded) variants.add(decoded)
+    const normalized = normalizePhoneJid(value.trim())
+    if (normalized) variants.add(normalized)
+    const user = getJidUser(value)
+    if (user) {
+      variants.add(`${user}@lid`)
+      variants.add(`${user}@s.whatsapp.net`)
+    }
+  }
+
+  addCandidate(jid)
+  const user = getJidUser(jid)
+
+  const participant = participants.find((entry) => {
+    const values = [entry?.id, entry?.jid, entry?.lid, entry?.phoneNumber, entry?.pn, entry?.participantPn]
+    return values.some((value) => {
+      if (typeof value !== 'string') return false
+      const normalized = normalizePhoneJid(value.trim()) || (conn.decodeJid ? conn.decodeJid(value) : value)
+      return typeof normalized === 'string' && (variants.has(normalized) || (user && getJidUser(normalized) === user))
+    })
+  })
+
+  if (participant) {
+    addCandidate(participant.id)
+    addCandidate(participant.jid)
+    addCandidate(participant.lid)
+    addCandidate(participant.phoneNumber)
+    addCandidate(participant.pn)
+    addCandidate(participant.participantPn)
+    addCandidate(getParticipantPhoneJid(conn, participant))
+  }
+
+  const getPnById = typeof conn.getPNById === 'function'
+    ? conn.getPNById.bind(conn)
+    : typeof conn.getPNForLID === 'function'
+      ? conn.getPNForLID.bind(conn)
+      : null
+  const getLidById = typeof conn.getLIDById === 'function'
+    ? conn.getLIDById.bind(conn)
+    : typeof conn.getLIDForPN === 'function'
+      ? conn.getLIDForPN.bind(conn)
+      : null
+
+  for (const candidate of [...variants]) {
+    if (getPnById) {
+      try { addCandidate(await getPnById(candidate)) } catch {}
+    }
+    if (getLidById) {
+      try { addCandidate(await getLidById(candidate)) } catch {}
+    }
+  }
+
+  return variants
+}
+
+async function findParticipantByJid(conn, jid, participants = []) {
+  if (!jid || !participants.length) return null
+  const variants = await getComparableJids(conn, jid, participants)
+  const user = getJidUser(jid)
+
+  return participants.find((participant) => {
+    const values = [participant?.id, participant?.jid, participant?.lid, participant?.phoneNumber, participant?.pn, participant?.participantPn]
+    return values.some((value) => {
+      if (typeof value !== 'string') return false
+      const normalized = normalizePhoneJid(value.trim()) || (conn.decodeJid ? conn.decodeJid(value) : value)
+      return typeof normalized === 'string' && (variants.has(normalized) || (user && getJidUser(normalized) === user))
+    })
+  }) || null
+}
+
+function getParticipantPhoneJid(conn, participant) {
+  const lidUser = getJidUser(participant?.lid)
+  const directCandidates = [
+    participant?.phoneNumber,
+    participant?.pn,
+    participant?.participantPn,
+    participant?.jid,
+    participant?.id
+  ]
+
+  for (const candidate of directCandidates) {
+    const normalized = normalizePhoneJid(typeof candidate === 'string' ? candidate.trim() : '')
+    if (!normalized?.endsWith('@s.whatsapp.net')) continue
+    if (!lidUser || getJidUser(normalized) !== lidUser) return normalized
+  }
+
+  for (const candidate of [participant?.jid, participant?.id]) {
+    const normalized = typeof candidate === 'string' ? conn.decodeJid(candidate) : candidate
+    if (typeof normalized === 'string' && normalized.endsWith('@s.whatsapp.net')) return normalized
+  }
+
+  return participant?.id ? conn.decodeJid(participant.id) : null
+}
+
+async function resolveMentionJid(conn, jid, participants = []) {
+  if (!jid || typeof jid !== 'string') return jid
+
+  const normalized = conn.decodeJid ? conn.decodeJid(jid) : jid
+  const user = getJidUser(jid)
+  const candidates = new Set([jid, normalized, `${user}@lid`, `${user}@s.whatsapp.net`].filter(Boolean))
+
+  const match = participants.find(participant => {
+    const values = [
+      participant?.id,
+      participant?.jid,
+      participant?.lid,
+      participant?.phoneNumber,
+      participant?.pn,
+      participant?.participantPn
+    ]
+
+    for (const value of values) {
+      const normalizedValue = normalizePhoneJid(typeof value === 'string' ? value.trim() : '') ||
+        (typeof value === 'string' ? conn.decodeJid(value) : value)
+
+      if (typeof normalizedValue === 'string' && candidates.has(normalizedValue)) return true
+      if (typeof normalizedValue === 'string' && getJidUser(normalizedValue) === user) return true
+    }
+
+    return false
+  })
+
+  if (match) return getParticipantPhoneJid(conn, match) || normalized
+
+  const getPnById = typeof conn.getPNById === 'function'
+    ? conn.getPNById.bind(conn)
+    : typeof conn.getPNForLID === 'function'
+      ? conn.getPNForLID.bind(conn)
+      : null
+
+  if (getPnById) {
+    for (const candidate of candidates) {
+      try {
+        const resolved = await getPnById(candidate)
+        if (resolved) return conn.decodeJid ? conn.decodeJid(resolved) : resolved
+      } catch {}
+    }
+  }
+
+  return normalized
 }
 
 export async function handler(chatUpdate) {
   if (!global.db.data.stats) global.db.data.stats = {}
   const stats = global.db.data.stats
+  const activePlugins = Object.entries(global.plugins).filter(([, plugin]) => plugin && !plugin.disabled)
 
   this.msgqueque = this.msgqueque || []
   if (!chatUpdate) return
-  
+
   this.pushMessage(chatUpdate.messages).catch(console.error)
   let m = chatUpdate.messages[chatUpdate.messages.length - 1]
   if (!m) return
-  
+
   const msgId = m.key?.id
   if (!msgId) return
-  
+
   if (global.processedMessages.has(msgId)) return
   global.processedMessages.add(msgId)
   setTimeout(() => global.processedMessages.delete(msgId), DUPLICATE_WINDOW)
-  
+
   if (global.db.data == null) await global.loadDatabase()
 
   m = smsg(this, m) || m
-  if (!m) return;
+  if (!m) return
 
-if (m.isGroup && (m.mtype === 'imageMessage' || m.mtype === 'stickerMessage')) {
-  console.log(`🖼️ [HANDLER] Antiporno ${m.mtype}`);
-  
-  const chat = global.db.data.chats[m.chat] || {};
-  if (!chat.antiporno) return;
-
-  const antipornoMarker = `ANTIPORNO_${m.key.id}`;
-  if (global.processedMessages.has(antipornoMarker)) return;
-  global.processedMessages.add(antipornoMarker);
-
-  try {
-    const buffer = await m.download();
-    console.log('📥 Buffer:', (buffer.length / 1024).toFixed(1), 'KB');
-
-    let analysisBuffer = buffer;
-
-    let sharp;
-    try {
-      sharp = (await import('sharp')).default;
-      if (m.mtype === 'stickerMessage') {
-        console.log('🎭 Sharp sticker...');
-        analysisBuffer = await sharp(buffer)
-          .jpeg({ quality: 90 })
-          .resize(512, 512, { fit: 'inside' })
-          .toBuffer();
-        console.log('✅ Sticker converted:', (analysisBuffer.length / 1024).toFixed(1), 'KB');
-      }
-    } catch (e) {
-      console.log('⚠️ Sharp non disponibile');
-    }
-
-    if (analysisBuffer.length < 1000) {
-      console.log('❌ Buffer troppo piccolo');
-      return;
-    }
-
-    console.log('🤖 Nyckel analysis...');
-    const result = await analyzeWithNyckel(analysisBuffer);
-    
-    if (result.isPorn && result.confidence > 0.75) {
-      console.log(`🛡️ NSFW: ${(result.confidence * 100).toFixed(1)}%`);
-      
-      const key = {
-        remoteJid: m.chat,
-        fromMe: false,
-        id: m.key.id,
-        participant: m.sender
-      };
-      
-      let deleteSuccess = false;
+  // ─── Risoluzione LID mentions ───
+  if (m.isGroup) {
+    const sourceMentions = m.msg?.contextInfo?.mentionedJid || m.mentionedJid || []
+    if (sourceMentions.length) {
       try {
-        await this.sendMessage(m.chat, { delete: key });
-        deleteSuccess = true;
-        console.log('✅ DELETE!');
-      } catch (e) {
-        console.log('❌ DELETE FAILED - Bot admin?');
-      }
-      
-      await this.sendMessage(m.chat, {
-        text: `🚫 *MATERIALE PORNOGRAFICO RILEVATO*\n\n📊 ${(result.confidence * 100).toFixed(1)}%\n👤 @${m.sender.split('@')[0]}\n📎 ${getMediaEmoji(m.mtype)}\n\n${deleteSuccess ? '✅ ELIMINATO' : '❌ BOT NON ADMIN?\n\n> Developed by ChatUnity'}`,
-        mentions: [m.sender]
-      });
-      
-      return;
-    } else {
-      console.log(`✅ Pulito: ${(result.confidence * 100).toFixed(1)}%`);
+        const metaData = await getGroupMetadataCached(this, m.chat)
+        const parts = metaData?.participants || []
+        const resolved = await Promise.all(sourceMentions.map(jid => resolveMentionJid(this, jid, parts)))
+        m.mentionedJid = resolved.filter(Boolean)
+        if (typeof m.text === 'string') {
+          const resolvedUsers = resolved.map(getJidUser).filter(Boolean)
+          let mentionIndex = 0
+          m.text = m.text.replace(/@(\d{5,})/g, (full) => {
+            const nextUser = resolvedUsers[mentionIndex++]
+            return nextUser ? `@${nextUser}` : full
+          })
+        }
+      } catch {}
     }
-  } catch (e) {
-    console.error('💥 Antiporno:', e.message);
-  } finally {
-    setTimeout(() => global.processedMessages.delete(antipornoMarker), 5000);
   }
-}
 
-else if (m.isGroup && m.mtype === 'videoMessage' && chat?.antiporno) {
-  console.log('🎥 [HANDLER] Video saltato (FFmpeg richiesto)');
-}
-
-async function analyzeWithNyckel(buffer) {
-  const axios = await import('axios');
-  const cheerio = await import('cheerio');
-  const { Blob, FormData } = await import('formdata-node');
-  const { FormDataEncoder } = await import('form-data-encoder');
-  const { Readable } = await import('stream');
-  
-  if (buffer.length < 1000 || buffer.length > 10 * 1024 * 1024) {
-    throw new Error(`Buffer invalido: ${buffer.length} bytes`);
-  }
-  
-  const headers = {
-    authority: "www.nyckel.com",
-    origin: "https://www.nyckel.com",
-    referer: "https://www.nyckel.com/pretrained-classifiers/nsfw-identifier",
-    "user-agent": "Postify/1.0.0",
-    "x-requested-with": "XMLHttpRequest",
-    'content-type': 'multipart/form-data'
-  };
-  
-  const res = await axios.default.get("https://www.nyckel.com/pretrained-classifiers/nsfw-identifier", { headers });
-  const $ = cheerio.load(res.data);
-  const src = $('script[src*="embed-image.js"]').attr("src");
-  const fid = src?.match(/[?&]id=([^&]+)/)?.[1];
-  
-  if (!fid) throw new Error('No Function ID');
-  
-  const blob = new Blob([buffer], { type: 'image/jpeg' });
-  const form = new FormData();
-  form.append('file', blob, 'image.jpg');
-  
-  const encoder = new FormDataEncoder(form);
-  const bodyStream = Readable.from(encoder.encode());
-  
-  const resp = await axios.default.post(
-    `https://www.nyckel.com/v1/functions/${fid}/invoke`,
-    bodyStream,
-    { 
-      headers: { 
-        ...headers, 
-        ...encoder.headers,
-        'content-length': encoder.headers['content-length']
-      },
-      timeout: 30000
-    }
-  );
-  
-  return {
-    isPorn: resp.data.labelName === "Porn",
-    confidence: resp.data.confidence || 0
-  };
-}
-
-function getMediaEmoji(mtype) {
-  return mtype === 'imageMessage' ? '🖼️' : mtype === 'stickerMessage' ? '🎭' : '📎';
-}
-
-  const ___dirname = path.join(path.dirname(fileURLToPath(import.meta.url)), './plugins')
-  
-  for (let name in global.plugins) {
-    let plugin = global.plugins[name]
-    if (!plugin || plugin.disabled) continue
+  for (const [name, plugin] of activePlugins) {
     const __filename = join(___dirname, name)
-    
     if (typeof plugin.all === 'function') {
       try {
-        await plugin.all.call(this, m, {
-          chatUpdate,
-          __dirname: ___dirname,
-          __filename
-        })
-      } catch (e) {
-        console.error(`Errore in plugin.all (${name}):`, e)
-      }
+        await plugin.all.call(this, m, { chatUpdate, __dirname: ___dirname, __filename })
+      } catch (e) { console.error(`Errore in plugin.all (${name}):`, e) }
     }
   }
+
+  if (m.commandBlocked) return
 
   const queue = selectQueue(m)
-  
   await queue.add(async () => {
-    try {
-      await processMessage.call(this, m, chatUpdate, stats)
-    } catch (error) {
-      console.error(`Errore processamento messaggio ${msgId}:`, error.message)
-    }
-  }).catch(err => {
-    if (err.message !== 'timeout') {
-      console.error('Errore coda:', err)
-    }
-  })
+    try { await processMessage.call(this, m, chatUpdate, stats, activePlugins) }
+    catch (error) { console.error(`Errore processamento messaggio ${msgId}:`, error.message) }
+  }).catch(err => { if (err.message !== 'timeout') console.error('Errore coda:', err) })
 }
 
-async function processMessage(m, chatUpdate, stats) {
-  const isOwner = (() => {
-    try {
-      const isROwner = [this.decodeJid(global.conn.user.id), ...global.owner.map(([number]) => number)]
-        .filter(Boolean)
-        .map(v => v.replace(/[^0-9]/g, '') + '@s.whatsapp.net')
-        .includes(m.sender)
-      return isROwner || m.fromMe
-    } catch {
-      return false
-    }
-  })()
-
-  const hasValidPrefix = (text, prefixes) => {
-    if (!text || typeof text !== 'string') return false
-    if (prefixes instanceof RegExp) return prefixes.test(text)
-    const prefixList = Array.isArray(prefixes) ? prefixes : [prefixes]
-    return prefixList.some(p => {
-      if (p instanceof RegExp) return p.test(text)
-      if (typeof p === 'string') return text.startsWith(p)
-      return false
-    })
-  }
-
-  if (
-    m.isGroup &&
-    !isOwner &&
-    typeof m.text === 'string' &&
-    hasValidPrefix(m.text, this.prefix || global.prefix)
-  ) {
-    const now = Date.now()
-    const chatId = m.chat
-
-    if (!global.groupSpam[chatId]) {
-      global.groupSpam[chatId] = {
-        count: 0,
-        firstCommandTimestamp: now,
-        isSuspended: false,
-        suspendedUntil: null
-      }
-    }
-
-    const groupData = global.groupSpam[chatId]
-    if (groupData.isSuspended) {
-      if (now < groupData.suspendedUntil) return
-      groupData.isSuspended = false
-      groupData.count = 0
-      groupData.firstCommandTimestamp = now
-      groupData.suspendedUntil = null
-    }
-    if (now - groupData.firstCommandTimestamp > 60000) {
-      groupData.count = 1
-      groupData.firstCommandTimestamp = now
-    } else {
-      groupData.count++
-    }
-    if (groupData.count > 2) {
-      groupData.isSuspended = true
-      groupData.suspendedUntil = now + 45000
-
-      await this.sendMessage(chatId, {
-        text: `『 ⚠ 』 Anti-spam comandi\n\nTroppi comandi in poco tempo!\nAttendi *45 secondi* prima di usare altri comandi.\n\n> sviluppato da sam aka vare`,
-        mentions: [m.sender]
-      })
-      return
-    }
-  }
-
+async function processMessage(m, chatUpdate, stats, activePlugins) {
   try {
     m.exp = 0
     m.limit = false
@@ -308,7 +287,6 @@ async function processMessage(m, chatUpdate, stats) {
     try {
       let user = global.db.data.users[m.sender]
       if (typeof user !== 'object') global.db.data.users[m.sender] = {}
-
       if (user) {
         if (!isNumber(user.messaggi)) user.messaggi = 0
         if (!isNumber(user.blasphemy)) user.blasphemy = 0
@@ -322,23 +300,14 @@ async function processMessage(m, chatUpdate, stats) {
         if (!('muto' in user)) user.muto = false
       } else {
         global.db.data.users[m.sender] = {
-          messaggi: 0,
-          blasphemy: 0,
-          exp: 0,
-          money: 0,
-          warn: 0,
-          joincount: 2,
-          limit: 15000,
-          premium: false,
-          premiumDate: -1,
-          name: m.name,
-          muto: false
+          messaggi: 0, blasphemy: 0, exp: 0, money: 0, warn: 0,
+          joincount: 2, limit: 15000, premium: false, premiumDate: -1,
+          name: m.name, muto: false
         }
       }
 
       let chat = global.db.data.chats[m.chat]
       if (typeof chat !== 'object') global.db.data.chats[m.chat] = {}
-
       if (chat) {
         if (!('isBanned' in chat)) chat.isBanned = false
         if (!('detect' in chat)) chat.detect = true
@@ -350,38 +319,25 @@ async function processMessage(m, chatUpdate, stats) {
         if (!('name' in chat)) chat.name = this.getName(m.chat)
         if (!('antispamcomandi' in chat)) chat.antispamcomandi = true
         if (!('welcome' in chat)) chat.welcome = true
+        if (!('bye' in chat)) chat.bye = 'welcome' in chat ? !!chat.welcome : true
       } else {
         global.db.data.chats[m.chat] = {
-          name: this.getName(m.chat),
-          isBanned: false,
-          detect: true,
-          delete: false,
-          antiLink: true,
-          antiTraba: true,
-          expired: 0,
-          messaggi: 0,
-          antispamcomandi: true,
-          welcome: true
+          name: this.getName(m.chat), isBanned: false, detect: true,
+          delete: false, antiLink: true, antiTraba: true, expired: 0,
+          messaggi: 0, antispamcomandi: true, welcome: true, bye: true
         }
       }
 
       let settings = global.db.data.settings[this.user.jid]
       if (typeof settings !== 'object') global.db.data.settings[this.user.jid] = {}
-
       if (settings) {
         if (!('self' in settings)) settings.self = false
         if (!('autoread' in settings)) settings.autoread = false
         if (!('restrict' in settings)) settings.restrict = true
       } else {
-        global.db.data.settings[this.user.jid] = {
-          self: false,
-          autoread: false,
-          restrict: true
-        }
+        global.db.data.settings[this.user.jid] = { self: false, autoread: false, restrict: true }
       }
-    } catch (e) {
-      console.error(e)
-    }
+    } catch (e) { console.error(e) }
 
     if (opts['nyimak']) return
     if (!m.fromMe && opts['self']) return
@@ -415,85 +371,57 @@ async function processMessage(m, chatUpdate, stats) {
 
     let groupMetadata = {}
     if (m.isGroup) {
-      const cached = global.groupMetaCache.get(m.chat)
-      if (cached && Date.now() - cached.timestamp < GROUP_META_CACHE_TTL) {
-        groupMetadata = cached.data
-      } else {
-        try {
-          groupMetadata = ((this.chats[m.chat] || {}).metadata || await this.groupMetadata(m.chat).catch(_ => null)) || {}
-          global.groupMetaCache.set(m.chat, {
-            data: groupMetadata,
-            timestamp: Date.now()
-          })
-        } catch {
-          groupMetadata = {}
-        }
-      }
+      groupMetadata = (await getGroupMetadataCached(this, m.chat)) || {}
     }
 
-    const participants = (m.isGroup ? groupMetadata.participants : []) || []
-    const normalizedParticipants = participants.map(u => {
+    let participants = (m.isGroup ? groupMetadata.participants : []) || []
+    let normalizedParticipants = participants.map(u => {
       const normalizedId = this.decodeJid(u.id)
       return { ...u, id: normalizedId, jid: u.jid || normalizedId }
     })
-    const user = (m.isGroup ? normalizedParticipants.find(u => this.decodeJid(u.id) === m.sender) : {}) || {}
-    const bot = (m.isGroup ? normalizedParticipants.find(u => this.decodeJid(u.id) == this.user.jid) : {}) || {}
+    let user = (m.isGroup ? await findParticipantByJid(this, m.sender, normalizedParticipants) : {}) || {}
+    let bot = (m.isGroup ? await findParticipantByJid(this, this.user.jid, normalizedParticipants) : {}) || {}
+    let isRAdmin = user?.admin == 'superadmin' || false
+    let isAdmin = m.isGroup ? hasAdminRole(user) : false
+    let isBotAdmin = m.isGroup ? hasAdminRole(bot) : false
 
-    async function isUserAdmin(conn, chatId, senderId) {
-      try {
-        const decodedSender = conn.decodeJid(senderId)
-        return groupMetadata?.participants?.some(p =>
-          (conn.decodeJid(p.id) === decodedSender || p.jid === decodedSender) &&
-          (p.admin === 'admin' || p.admin === 'superadmin')
-        ) || false
-      } catch {
-        return false
+    if (m.isGroup && (!user || !bot)) {
+      const freshMetadata = await getGroupMetadataCached(this, m.chat, { force: true })
+      const freshParticipants = freshMetadata?.participants || []
+      if (freshParticipants.length) {
+        groupMetadata = freshMetadata
+        participants = freshParticipants
+        normalizedParticipants = freshParticipants.map(u => {
+          const normalizedId = this.decodeJid(u.id)
+          return { ...u, id: normalizedId, jid: u.jid || normalizedId }
+        })
+        user = (await findParticipantByJid(this, m.sender, normalizedParticipants)) || {}
+        bot = (await findParticipantByJid(this, this.user.jid, normalizedParticipants)) || {}
+        isRAdmin = user?.admin == 'superadmin' || false
+        isAdmin = hasAdminRole(user)
+        isBotAdmin = hasAdminRole(bot)
       }
     }
 
-    const isRAdmin = user?.admin == 'superadmin' || false
-    const isAdmin = m.isGroup ? await isUserAdmin(this, m.chat, m.sender) : false
-    const isBotAdmin = m.isGroup ? await isUserAdmin(this, m.chat, this.user.jid) : false
+    if (m.commandBlocked) return
 
-    const ___dirname = path.join(path.dirname(fileURLToPath(import.meta.url)), './plugins')
-    
-    for (let name in global.plugins) {
-      let plugin = global.plugins[name]
-      if (!plugin || plugin.disabled) continue
+    for (const [name, plugin] of activePlugins) {
       const __filename = join(___dirname, name)
-      
       if (!opts['restrict'] && plugin.tags?.includes('admin')) continue
-      
       if (typeof plugin.before === 'function') {
         try {
           const shouldContinue = await plugin.before.call(this, m, {
-            conn: this,
-            participants: normalizedParticipants,
-            groupMetadata,
-            user,
-            bot,
-            isROwner,
-            isOwner: isOwner2,
-            isRAdmin,
-            isAdmin,
-            isBotAdmin,
-            isPrems,
-            chatUpdate,
-            __dirname: ___dirname,
-            __filename
+            conn: this, participants: normalizedParticipants, groupMetadata,
+            user, bot, isROwner, isOwner: isOwner2, isRAdmin, isAdmin,
+            isBotAdmin, isPrems, chatUpdate, __dirname: ___dirname, __filename
           })
           if (shouldContinue) continue
-        } catch (e) {
-          console.error(`Errore in plugin.before (${name}):`, e)
-        }
+        } catch (e) { console.error(`Errore in plugin.before (${name}):`, e) }
       }
     }
 
-    for (let name in global.plugins) {
-      let plugin = global.plugins[name]
-      if (!plugin || plugin.disabled) continue
+    for (const [name, plugin] of activePlugins) {
       const __filename = join(___dirname, name)
-
       if (!opts['restrict'] && plugin.tags?.includes('admin')) continue
 
       const str2Regex = str => str.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&')
@@ -501,10 +429,7 @@ async function processMessage(m, chatUpdate, stats) {
       let match = (_prefix instanceof RegExp ?
         [[_prefix.exec(m.text), _prefix]] :
         Array.isArray(_prefix) ?
-          _prefix.map(p => {
-            let re = p instanceof RegExp ? p : new RegExp(str2Regex(p))
-            return [re.exec(m.text), re]
-          }) :
+          _prefix.map(p => { let re = p instanceof RegExp ? p : new RegExp(str2Regex(p)); return [re.exec(m.text), re] }) :
           typeof _prefix === 'string' ?
             [[new RegExp(str2Regex(_prefix)).exec(m.text), new RegExp(str2Regex(_prefix))]] :
             [[[], new RegExp]]
@@ -525,9 +450,7 @@ async function processMessage(m, chatUpdate, stats) {
           plugin.command.test(command) :
           Array.isArray(plugin.command) ?
             plugin.command.some(cmd => cmd instanceof RegExp ? cmd.test(command) : cmd === command) :
-            typeof plugin.command === 'string' ?
-              plugin.command === command :
-              false
+            typeof plugin.command === 'string' ? plugin.command === command : false
 
         if (!isAccept) continue
 
@@ -544,85 +467,32 @@ async function processMessage(m, chatUpdate, stats) {
         let mystica = `${plugin.botAdmin || plugin.admin || plugin.group || plugin || noPrefix || _prefix || m.text.slice(0, 1) == _prefix || plugin.command}`
         if (adminMode && !isOwner2 && !isROwner && m.isGroup && !isAdmin && mystica) return
 
-        if (plugin.rowner && plugin.owner && !(isROwner || isOwner2)) {
-          fail('owner', m, this)
-          continue
-        }
-        if (plugin.rowner && !isROwner) {
-          fail('rowner', m, this)
-          continue
-        }
-        if (plugin.owner && !isOwner2) {
-          fail('owner', m, this)
-          continue
-        }
-        if (plugin.mods && !isMods) {
-          fail('mods', m, this)
-          continue
-        }
-        if (plugin.premium && !isPrems) {
-          fail('premium', m, this)
-          continue
-        }
-        if (plugin.group && !m.isGroup) {
-          fail('group', m, this)
-          continue
-        } else if (plugin.botAdmin && !isBotAdmin) {
-          fail('botAdmin', m, this)
-          continue
-        } else if (plugin.admin && !isAdmin) {
-          fail('admin', m, this)
-          continue
-        }
-        if (plugin.private && m.isGroup) {
-          fail('private', m, this)
-          continue
-        }
-        if (plugin.register == true && _user?.registered == false) {
-          fail('unreg', m, this)
-          continue
-        }
+        if (plugin.rowner && plugin.owner && !(isROwner || isOwner2)) { fail('owner', m, this); continue }
+        if (plugin.rowner && !isROwner) { fail('rowner', m, this); continue }
+        if (plugin.owner && !isOwner2) { fail('owner', m, this); continue }
+        if (plugin.mods && !isMods) { fail('mods', m, this); continue }
+        if (plugin.premium && !isPrems) { fail('premium', m, this); continue }
+        if (plugin.group && !m.isGroup) { fail('group', m, this); continue }
+        else if (plugin.botAdmin && !isBotAdmin) { fail('botAdmin', m, this); continue }
+        else if (plugin.admin && !isAdmin) { fail('admin', m, this); continue }
+        if (plugin.private && m.isGroup) { fail('private', m, this); continue }
+        if (plugin.register == true && _user?.registered == false) { fail('unreg', m, this); continue }
 
         m.isCommand = true
         let xp = 'exp' in plugin ? parseInt(plugin.exp) : 17
         if (xp > 2000) m.reply('Exp limit')
-        else if (plugin.money && global.db.data.users[m.sender]?.money < plugin.money * 1) {
-          fail('senzasoldi', m, this)
-          continue
-        }
+        else if (plugin.money && global.db.data.users[m.sender]?.money < plugin.money * 1) { fail('senzasoldi', m, this); continue }
         m.exp += xp
 
-        if (!isPrems && plugin.limit && global.db.data.users[m.sender]?.limit < plugin.limit * 1) {
-          continue
-        }
-        if (plugin.level > _user?.level) {
-          this.reply(m.chat, `livello troppo basso`, m)
-          continue
-        }
+        if (!isPrems && plugin.limit && global.db.data.users[m.sender]?.limit < plugin.limit * 1) continue
+        if (plugin.level > _user?.level) { this.reply(m.chat, `livello troppo basso`, m); continue }
 
         let extra = {
-          match,
-          usedPrefix,
-          noPrefix,
-          _args,
-          args,
-          command,
-          text,
-          conn: this,
-          normalizedParticipants,
-          participants,
-          groupMetadata,
-          user,
-          bot,
-          isROwner,
-          isOwner: isOwner2,
-          isRAdmin,
-          isAdmin,
-          isBotAdmin,
-          isPrems,
-          chatUpdate,
-          __dirname: ___dirname,
-          __filename
+          match, usedPrefix, noPrefix, _args, args, command, text,
+          conn: this, normalizedParticipants, participants, groupMetadata,
+          user, bot, isROwner, isOwner: isOwner2, isRAdmin, isAdmin,
+          isBotAdmin, isPrems, chatUpdate, __dirname: ___dirname, __filename,
+          mentionedJid: m.mentionedJid || []
         }
 
         try {
@@ -636,17 +506,14 @@ async function processMessage(m, chatUpdate, stats) {
           console.error(e)
           if (e) {
             let textErr = format(e)
-            for (let key of Object.values(global.APIKeys))
+            for (let key of Object.values(global.APIKeys || {}))
               textErr = textErr.replace(new RegExp(key, 'g'), '#HIDDEN#')
             m.reply(textErr)
           }
         } finally {
           if (typeof plugin.after === 'function') {
-            try {
-              await plugin.after.call(this, m, extra)
-            } catch (e) {
-              console.error(`Errore in plugin.after (${name}):`, e)
-            }
+            try { await plugin.after.call(this, m, extra) }
+            catch (e) { console.error(`Errore in plugin.after (${name}):`, e) }
           }
         }
         break
@@ -665,13 +532,8 @@ async function processMessage(m, chatUpdate, stats) {
       let chat = global.db.data.chats[m.chat]
       if (user?.muto) {
         await this.sendMessage(m.chat, {
-          delete: {
-            remoteJid: m.chat,
-            fromMe: false,
-            id: m.key.id,
-            participant: m.key.participant
-          }
-        })
+          delete: { remoteJid: m.chat, fromMe: false, id: m.key.id, participant: m.key.participant }
+        }).catch(console.error)
       }
       if (user) {
         user.exp += m.exp
@@ -681,30 +543,23 @@ async function processMessage(m, chatUpdate, stats) {
       }
       if (chat) chat.messaggi += 1
     }
+
     if (m?.plugin) {
       let now = +new Date
-      if (!stats[m.plugin]) {
-        stats[m.plugin] = {
-          total: 0,
-          success: 0,
-          last: 0,
-          lastSuccess: 0
-        }
-      }
+      if (!stats[m.plugin]) stats[m.plugin] = { total: 0, success: 0, last: 0, lastSuccess: 0 }
       const stat = stats[m.plugin]
       stat.total += 1
       stat.last = now
-      if (!m.error) {
-        stat.success += 1
-        stat.lastSuccess = now
-      }
+      if (!m.error) { stat.success += 1; stat.lastSuccess = now }
+    }
+
+    if (typeof global.markDbDirty === 'function') {
+      global.markDbDirty()
     }
 
     try {
       if (!opts['noprint']) await (await import(`./lib/print.js`)).default(m, this)
-    } catch (e) {
-      console.log(m, m.quoted, e)
-    }
+    } catch (e) { console.log(m, m.quoted, e) }
     if (opts['autoread']) await this.readMessages([m.key])
   }
 }
@@ -712,63 +567,47 @@ async function processMessage(m, chatUpdate, stats) {
 export async function participantsUpdate({ id, participants, action }) {
   if (opts['self']) return
   if (this.isInit) return
-  if (global.db.data == null) await loadDatabase()
+  if (global.db.data == null) await global.loadDatabase()
+  invalidateGroupMetaCache(id)
 
   let chat = global.db.data.chats[id] || {}
   let text = ''
-  let nomeDelBot = global.db.data.nomedelbot || `𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲-𝐁𝐨𝐭`
-  let jidCanale = global.db.data.jidcanale || '120363259442839354@newsletter'
 
   switch (action) {
     case 'add':
     case 'remove':
-      if (chat.welcome) {
-        let groupMetadata = await this.groupMetadata(id) || (this.chats[id] || {}).metadata
+      if ((action === 'add' && chat.welcome) || (action === 'remove' && chat.bye)) {
+        let groupMetadata = await this.groupMetadata(id).catch(() => (this.chats[id] || {}).metadata || {})
         for (let user of participants) {
-          let pp = './menu/principale.jpeg'
-          try {
-            pp = await this.profilePictureUrl(user, 'image')
-          } catch (e) {
-          } finally {
-            let apii = await this.getFile(pp)
-
-            if (action === 'add') {
-              text = (chat.sWelcome || this.welcome || conn.welcome || 'benvenuto, @user!')
-                .replace('@subject', await this.getName(id))
-                .replace('@desc', groupMetadata.desc?.toString() || 'bot')
-                .replace('@user', '@' + user.split('@')[0])
-            } else if (action === 'remove') {
-              text = (chat.sBye || this.bye || conn.bye || 'bye bye, @user!')
-                .replace('@user', '@' + user.split('@')[0])
-            }
-
-            this.sendMessage(id, {
-              text: text,
-              contextInfo: {
-                mentionedJid: [user],
-                forwardingScore: 99,
-                isForwarded: true,
-                forwardedNewsletterMessageInfo: {
-                  newsletterJid: jidCanale,
-                  serverMessageId: '',
-                  newsletterName: `${nomeDelBot}`
-                },
-                externalAdReply: {
-                  title: (
-                    action === 'add'
-                      ? '𝐌𝐞𝐬𝐬𝐚𝐠𝐠𝐢𝐨 𝐝𝐢 𝐛𝐞𝐧𝐯𝐞𝐧𝐮𝐭𝐨'
-                      : '𝐌𝐞𝐬𝐬𝐚𝐠𝐠𝐢𝐨 𝐝𝐢 𝐚𝐝𝐝𝐢𝐨'
-                  ),
-                  body: ``,
-                  previewType: 'PHOTO',
-                  thumbnailUrl: ``,
-                  thumbnail: apii.data,
-                  mediaType: 1,
-                  renderLargerThumbnail: false
-                }
-              }
-            })
+          if (action === 'add') {
+            text = (chat.sWelcome || this.welcome || 'benvenuto, @user!')
+              .replace('@subject', await this.getName(id))
+              .replace('@desc', groupMetadata.desc?.toString() || '')
+              .replace('@user', '@' + user.split('@')[0])
+          } else if (action === 'remove') {
+            text = (chat.sBye || this.bye || 'bye bye, @user!')
+              .replace('@user', '@' + user.split('@')[0])
           }
+
+          const mediaName = action === 'add' ? 'welcome.mp4' : 'addio.mp4'
+          const mediaPath = path.join(MEDIA_GIF_DIR, mediaName)
+
+          if (fs.existsSync(mediaPath)) {
+            const videoBuffer = fs.readFileSync(mediaPath)
+            await this.sendMessage(id, {
+              video: videoBuffer,
+              gifPlayback: true,
+              mimetype: 'video/mp4',
+              caption: text,
+              mentions: [user]
+            }).catch(console.error)
+            continue
+          }
+
+          await this.sendMessage(id, {
+            text,
+            mentions: [user]
+          }).catch(console.error)
         }
       }
       break
@@ -780,38 +619,36 @@ export async function groupsUpdate(groupsUpdate) {
   for (const groupUpdate of groupsUpdate) {
     const id = groupUpdate.id
     if (!id) continue
-    let chats = global.db.data.chats[id], text = ''
-    if (groupUpdate.icon) text = (chats.sIcon || this.sIcon || conn.sIcon || '`immagine modificata`').replace('@icon', groupUpdate.icon)
-    if (groupUpdate.revoke) text = (chats.sRevoke || this.sRevoke || conn.sRevoke || '`link reimpostato, nuovo link:`\n@revoke').replace('@revoke', groupUpdate.revoke)
+    invalidateGroupMetaCache(id)
+    let chats = global.db.data.chats[id] || {}
+    let text = ''
+    if (groupUpdate.icon) text = (chats.sIcon || this.sIcon || '`immagine modificata`').replace('@icon', groupUpdate.icon)
+    if (groupUpdate.revoke) text = (chats.sRevoke || this.sRevoke || '`link reimpostato, nuovo link:`\n@revoke').replace('@revoke', groupUpdate.revoke)
     if (!text) continue
-    await this.sendMessage(id, { text, mentions: this.parseMention(text) })
+    await this.sendMessage(id, { text, mentions: this.parseMention(text) }).catch(console.error)
   }
 }
 
 export async function callUpdate(callUpdate) {
-  let isAnticall = global.db.data.settings[this.user.jid].antiCall
+  let isAnticall = global.db.data.settings?.[this.user.jid]?.antiCall
   if (!isAnticall) return
   for (let nk of callUpdate) {
-    if (nk.isGroup == false) {
-      if (nk.status == 'offer') {
-        let callmsg = await this.reply(nk.from, `ciao @${nk.from.split('@')[0]}, c'è anticall.`, false, { mentions: [nk.from] })
-        let vcard = `BEGIN:VCARD\nVERSION:5.0\nN:;𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲;;;\nFN:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nORG:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nTITLE:\nitem1.TEL;waid=393773842461:+39 3515533859\nitem1.X-ABLabel:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nX-WA-BIZ-DESCRIPTION:ofc\nX-WA-BIZ-NAME:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nEND:VCARD`
-        await this.sendMessage(nk.from, { contacts: { displayName: 'Unlimited', contacts: [{ vcard }] } }, { quoted: callmsg })
-        await this.updateBlockStatus(nk.from, 'block')
-      }
+    if (!nk.isGroup && nk.status === 'offer') {
+      let callmsg = await this.reply(nk.from, `ciao @${nk.from.split('@')[0]}, c'è anticall.`, false, { mentions: [nk.from] }).catch(console.error)
+      let vcard = `BEGIN:VCARD\nVERSION:5.0\nN:;𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲;;;\nFN:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nORG:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nTITLE:\nitem1.TEL;waid=393773842461:+39 3515533859\nitem1.X-ABLabel:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nX-WA-BIZ-DESCRIPTION:ofc\nX-WA-BIZ-NAME:𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲\nEND:VCARD`
+      await this.sendMessage(nk.from, { contacts: { displayName: 'Unlimited', contacts: [{ vcard }] } }, { quoted: callmsg }).catch(console.error)
+      await this.updateBlockStatus(nk.from, 'block').catch(console.error)
     }
   }
 }
 
 export async function deleteUpdate(message) {
   try {
-    const { fromMe, id, participant } = message
+    const { fromMe, id } = message
     if (fromMe) return
     let msg = this.serializeM(this.loadMessage(id))
     if (!msg) return
-  } catch (e) {
-    console.error(e)
-  }
+  } catch (e) { console.error(e) }
 }
 
 global.dfail = (type, m, conn) => {
@@ -831,7 +668,7 @@ global.dfail = (type, m, conn) => {
     contextInfo: {
       externalAdReply: {
         title: `${msg}`,
-        body: ``,
+        body: '',
         previewType: 'PHOTO',
         thumbnail: fs.readFileSync('./media/principale.jpeg'),
         mediaType: 1,
