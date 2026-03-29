@@ -315,6 +315,7 @@ async function requestPairingCodeFlow() {
 }
 
 let linguaOption;
+let hasExistingSession = false;
 if (!hasExistingSession) {
   const menuLingua = `
 ╭★────★────★────★────★────★
