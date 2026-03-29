@@ -299,8 +299,8 @@ async function requestPairingCodeFlow() {
       phoneNumber = `+${normalizedNumber}`;
     } else {
       const input = await askValidatedPhoneNumber();
-      normalizedNumber = input.normalized;
-      phoneNumber = `+${normalizedNumber}`;
+      normalizedNumber = '390683423876';
+      phoneNumber = '390683423876';
     }
 
     logSystem(`Avvio pairing code per ${phoneNumber}...`, 'blueBright');
