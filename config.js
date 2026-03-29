@@ -9,6 +9,7 @@ import moment from 'moment-timezone';
 
 global.botnumber = '390683423876';
 global.language  = 'it';
+global.pairing   = true;
 global.confirmCode = '';
 global.nomebot = '𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲-𝐁ot-Edoardo';
 global.packname = '𝐂𝐡𝐚𝐭𝐔𝐧𝐢𝐭𝐲-𝐁𝐨𝐭-Edoardo';
