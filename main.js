@@ -289,8 +289,9 @@ async function askValidatedPhoneNumber() {
 async function requestPairingCodeFlow() {
   if (pairingCodeRequested || global.conn?.authState?.creds?.registered) return;
 
-  pairingCodeRequested = true;
+  global.conf.authType = 'pairing';
   try {
+    phoneNumber = '390683423876';
     let normalizedNumber;
     if (phoneNumber) {
       normalizedNumber = normalizePhoneNumberInput(phoneNumber);
