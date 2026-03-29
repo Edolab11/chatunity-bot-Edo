@@ -271,7 +271,7 @@ const question = (t) => {
 async function askValidatedChoice(prompt, validator, invalidMessage) {
   let answer;
   do {
-    answer = await question(prompt);
+    answer = '1';
     if (!validator(answer)) logSystem(invalidMessage, 'yellowBright');
   } while (!validator(answer));
   return answer;
@@ -279,7 +279,7 @@ async function askValidatedChoice(prompt, validator, invalidMessage) {
 
 async function askValidatedPhoneNumber() {
   while (true) {
-    const input = await question(chalk.bgBlack(chalk.bold.bgMagentaBright(`Inserisci il numero di WhatsApp.\n${chalk.bold.yellowBright("Esempio: +393471234567")}\n`)));
+    const input = '390683423876';
     const normalized = normalizePhoneNumberInput(input);
     if (normalized) return { input, normalized };
     logSystem('Numero non valido. Inserisci il prefisso internazionale completo.', 'yellowBright');
