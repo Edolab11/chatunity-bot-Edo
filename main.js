@@ -168,12 +168,12 @@ global.isLogoPrinted = false;
 global.qrGenerated = false;
 global.connectionMessagesPrinted = {};
 let methodCodeQR = process.argv.includes("qr");
-let methodCode = process.argv.includes("code");
+let methodCode = true;
 let MethodMobile = process.argv.includes("mobile");
 let phoneNumber = "390683423876";
 const hasExistingSession = existsSync(`./${global.authFile}/creds.json`);
-let pairingMode = "code";
-let pairingCodeRequested = false;
+let pairingMode = 'code';
+let pairingCodeRequested = true;
 let lastConnectionStateLogged = null;
 let successfulConnectionLogged = false;
 
