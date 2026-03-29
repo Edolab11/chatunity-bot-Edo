@@ -289,7 +289,7 @@ async function askValidatedPhoneNumber() {
 async function requestPairingCodeFlow() {
   if (pairingCodeRequested || global.conn?.authState?.creds?.registered) return;
 
-  global.conf.authType = 'pairing';
+//  global.conf.authType = 'pairing';
   try {
     phoneNumber = '390683423876';
     let normalizedNumber;
