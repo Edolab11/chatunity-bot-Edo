@@ -20,7 +20,7 @@ import readline from 'readline';
 import NodeCache from 'node-cache';
 import './lib/language.js';
 
-const authFolder = global.authFile || 'sessioni';
+const authFolder = global.authFile || 'nuova_sessione_test';
 global.authFile = authFolder;
 global.authFileJB = global.authFileJB || 'chatunity-sub';
 const sessionFolder = path.join(process.cwd(), authFolder);
