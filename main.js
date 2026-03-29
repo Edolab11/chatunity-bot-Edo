@@ -421,7 +421,7 @@ global.store = {
 const connectionOptions = {
   logger,
   printQRInTerminal: pairingMode === 'qr',
-  mobile: MethodMobile,
+  mobile: true,
   auth: {
     creds: state.creds,
     keys: makeCacheableSignalKeyStore(state.keys, logger),
